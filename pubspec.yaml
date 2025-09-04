@@ -73,7 +73,8 @@ dependencies:
   google_maps_flutter_ios: 2.15.2
   google_maps_flutter_platform_interface: 2.12.1
   google_maps_flutter_web: 0.5.12
-  google_navigation_flutter: ^0.6.4
+  # Downgrade to a version compatible with GoogleMaps < 10.0
+  google_navigation_flutter: 0.5.2
   google_sign_in: 6.3.0
   google_sign_in_android: 6.2.1
   google_sign_in_ios: 5.9.0
