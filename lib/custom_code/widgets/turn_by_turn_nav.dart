@@ -10,15 +10,18 @@ import 'package:flutter/material.dart';
 // Begin custom widget code
 // DO NOT REMOVE OR MODIFY THE CODE ABOVE!
 
-// Turn-by-turn IN-APP com Google Navigation SDK (NÃO abre Google Maps externo).
-// Mantém sua API pública:
+// Turn-by-turn in-app map using native Google Maps SDK via google_maps_flutter.
+// Maintains the same public API:
 //   TurnByTurnNav(apiKey, userLatLng, placeLatLng, ... width, height, useDeviceCompass)
-// Suporta Android/iOS (Web não é suportado pelo plugin).
+// Supports Android/iOS (Web shows message as plugin does not support full navigation).
 
 import 'dart:async';
+import 'dart:convert';
 import 'package:flutter/foundation.dart' show kIsWeb;
-import 'package:google_navigation_flutter/google_navigation_flutter.dart'
-    as gnav;
+import 'package:google_maps_flutter/google_maps_flutter.dart' as gmaps;
+import 'package:geolocator/geolocator.dart';
+import 'package:flutter_polyline_points/flutter_polyline_points.dart';
+import 'package:http/http.dart' as http;
 import '/flutter_flow/lat_lng.dart' as ff;
 
 class TurnByTurnNav extends StatefulWidget {
@@ -29,12 +32,11 @@ class TurnByTurnNav extends StatefulWidget {
     required this.placeLatLng, // destination
     this.userPhotoUrl,
     this.arrivalRadiusMeters = 25,
-    this.simulateIfNoGPS =
-        false, // (sem simulação programática; usar sim do emulador)
+    this.simulateIfNoGPS = false,
     this.initialDriverLatLng,
     required this.width,
     required this.height,
-    this.useDeviceCompass = true, // ignorado aqui; o SDK gerencia a orientação
+    this.useDeviceCompass = true,
   }) : super(key: key);
 
   final String apiKey;
@@ -53,147 +55,155 @@ class TurnByTurnNav extends StatefulWidget {
 }
 
 class _TurnByTurnNavState extends State<TurnByTurnNav> {
-  gnav.GoogleNavigationViewController? _view;
-  StreamSubscription? _timeDistSub;
-  StreamSubscription? _arriveSub;
-  StreamSubscription? _snapSub;
+  gmaps.GoogleMapController? _map;
+  StreamSubscription<Position>? _posSub;
+
+  Set<gmaps.Polyline> _polylines = {};
+  Set<gmaps.Marker> _markers = {};
 
   String _status = 'Inicializando...';
   String _etaText = '';
   double _remainingMeters = 0;
 
-  bool _sessionReady = false;
   bool _guidanceRunning = false;
+  gmaps.LatLng? _currentLatLng;
+  gmaps.LatLngBounds? _routeBounds;
+
+  gmaps.LatLng _toG(ff.LatLng v) =>
+      gmaps.LatLng(v.latitude, v.longitude);
 
   @override
   void initState() {
     super.initState();
     if (kIsWeb) {
-      _status = 'Google Navigation não suporta Web.';
+      _status = 'Navegação não suportada no Web.';
     }
   }
 
   @override
   void dispose() {
-    _timeDistSub?.cancel();
-    _arriveSub?.cancel();
-    _snapSub?.cancel();
-    gnav.GoogleMapsNavigator.stopGuidance();
+    _posSub?.cancel();
     super.dispose();
   }
 
-  gnav.LatLng _toG(ff.LatLng v) =>
-      gnav.LatLng(latitude: v.latitude, longitude: v.longitude);
-
-  Future<void> _ensureSession() async {
-    if (_sessionReady) return;
-
-    // Requisitos do SDK: inicializar sessão e aceitar termos se necessário.
-    // (títulos fixos aqui, SEM adicionar parâmetro no seu widget)
-    final accepted = await gnav.GoogleMapsNavigator.areTermsAccepted();
-    if (!accepted) {
-      await gnav.GoogleMapsNavigator.showTermsAndConditionsDialog(
-        'Terms of Service',
-        'Your Company',
-      );
+  Future<void> _loadRoute() async {
+    final origin = widget.initialDriverLatLng ?? widget.userLatLng;
+    final originStr = '${origin.latitude},${origin.longitude}';
+    final destStr =
+        '${widget.placeLatLng.latitude},${widget.placeLatLng.longitude}';
+    var url =
+        'https://maps.googleapis.com/maps/api/directions/json?origin=$originStr&destination=$destStr&key=${widget.apiKey}';
+    if (widget.initialDriverLatLng != null) {
+      final wp =
+          '${widget.userLatLng.latitude},${widget.userLatLng.longitude}';
+      url += '&waypoints=$wp';
     }
 
-    await gnav.GoogleMapsNavigator.initializeNavigationSession();
-    // iOS: opcional permitir atualização em background (voice/rota).
-    await gnav.GoogleMapsNavigator.allowBackgroundLocationUpdates(true);
+    final res = await http.get(Uri.parse(url));
+    if (res.statusCode != 200) {
+      setState(() => _status = 'Erro ao obter rota');
+      return;
+    }
+    final data = json.decode(res.body);
+    final routes = data['routes'] as List?;
+    if (routes == null || routes.isEmpty) {
+      setState(() => _status = 'Rota não encontrada');
+      return;
+    }
 
-    _sessionReady = true;
-  }
+    final route = routes[0];
+    final leg = (route['legs'] as List).first;
+    final poly = route['overview_polyline']['points'] as String;
 
-  Future<void> _listenEvents() async {
-    // Atualiza ETA e distância restante
-    _timeDistSub?.cancel();
-    _timeDistSub = (await gnav.GoogleMapsNavigator
-        .setOnRemainingTimeOrDistanceChangedListener((evt) {
-      // evt.remainingTime (s) e evt.remainingDistance (m)
-      final secs = (evt.remainingTime ?? 0).round();
-      final meters = (evt.remainingDistance ?? 0).toDouble();
-      setState(() {
-        _etaText = _fmtEta(secs);
-        _remainingMeters = meters;
-      });
-    }));
+    final points = PolylinePoints().decodePolyline(poly);
+    final polyCoords = points
+        .map((e) => gmaps.LatLng(e.latitude, e.longitude))
+        .toList();
 
-    // Chegada em waypoint
-    _arriveSub?.cancel();
-    _arriveSub =
-        (await gnav.GoogleMapsNavigator.setOnArrivalListener((onArrive) async {
-      // Tenta seguir para o próximo destino; se não houver, acabou.
-      final next = await gnav.GoogleMapsNavigator.continueToNextDestination();
-      if (next == null) {
-        setState(() {
-          _status = 'Chegou ao destino. Corrida concluída.';
-          _guidanceRunning = false;
-        });
-      }
-    }));
-
-    // Localização "road-snapped" (só para status leve)
-    _snapSub?.cancel();
-    _snapSub =
-        (await gnav.GoogleMapsNavigator.setRoadSnappedLocationUpdatedListener(
-            (evt) {
-      if (!_guidanceRunning) return;
-      setState(() => _status = 'Navegando...');
-    }));
-  }
-
-  Future<void> _startNav() async {
-    if (kIsWeb) return;
-
-    setState(() => _status = 'Preparando navegação...');
-    await _ensureSession();
-    await _listenEvents();
-
-    // Destinos em sequência: pickup -> destination
-    final pickup = gnav.NavigationWaypoint.withLatLngTarget(
-      title: 'Pickup',
-      target: _toG(widget.userLatLng),
-    );
-    final drop = gnav.NavigationWaypoint.withLatLngTarget(
-      title: 'Destination',
-      target: _toG(widget.placeLatLng),
+    final polyline = gmaps.Polyline(
+      polylineId: const gmaps.PolylineId('route'),
+      color: Colors.blue,
+      width: 6,
+      points: polyCoords,
     );
 
-    final display = gnav.NavigationDisplayOptions(
-        // Mantemos UI nativa do SDK ligada:
-        // (botões de overview, instruções, etc.)
-        // Você pode ajustar outras flags dessa classe conforme sua necessidade.
-        );
-
-    final dests = gnav.Destinations(
-      waypoints: [pickup, drop],
-      displayOptions: display,
-      // routingOptions: gnav.RoutingOptions() // opcional
+    final pickupMarker = gmaps.Marker(
+      markerId: const gmaps.MarkerId('pickup'),
+      position: _toG(widget.userLatLng),
+    );
+    final destMarker = gmaps.Marker(
+      markerId: const gmaps.MarkerId('dest'),
+      position: _toG(widget.placeLatLng),
     );
 
-    final status = await gnav.GoogleMapsNavigator.setDestinations(dests);
-    // status esperado: ok/routeFound (enum dentro do plugin).
-    await gnav.GoogleMapsNavigator.startGuidance();
+    _routeBounds = _boundsFrom(polyCoords);
 
-    // UI do widget de navegação:
-    await _view?.setNavigationUIEnabled(true);
-    await _view?.followMyLocation();
-
-    // Estado inicial de ETA/distância
-    final tnd = await gnav.GoogleMapsNavigator.getCurrentTimeAndDistance();
     setState(() {
-      _etaText = _fmtEta((tnd.remainingTime ?? 0).round());
-      _remainingMeters = (tnd.remainingDistance ?? 0).toDouble();
+      _polylines = {polyline};
+      _markers = {pickupMarker, destMarker};
+      _etaText = leg['duration']['text'];
+      _remainingMeters = (leg['distance']['value'] as num).toDouble();
       _status = 'Navegando...';
       _guidanceRunning = true;
     });
+
+    await _map?.animateCamera(
+        gmaps.CameraUpdate.newLatLngBounds(_routeBounds!, 50));
+
+    _startLocationUpdates();
   }
 
-  String _fmtEta(int seconds) {
-    if (seconds <= 59) return '1 min';
-    final mins = (seconds / 60).ceil();
-    return '$mins min';
+  gmaps.LatLngBounds _boundsFrom(List<gmaps.LatLng> list) {
+    double? x0, x1, y0, y1;
+    for (final latLng in list) {
+      if (x0 == null) {
+        x0 = x1 = latLng.latitude;
+        y0 = y1 = latLng.longitude;
+      } else {
+        if (latLng.latitude > x1!) x1 = latLng.latitude;
+        if (latLng.latitude < x0) x0 = latLng.latitude;
+        if (latLng.longitude > y1!) y1 = latLng.longitude;
+        if (latLng.longitude < y0!) y0 = latLng.longitude;
+      }
+    }
+    return gmaps.LatLngBounds(
+        southwest: gmaps.LatLng(x0!, y0!), northeast: gmaps.LatLng(x1!, y1!));
+  }
+
+  void _startLocationUpdates() {
+    _posSub?.cancel();
+    _posSub = Geolocator.getPositionStream().listen((pos) {
+      _currentLatLng = gmaps.LatLng(pos.latitude, pos.longitude);
+      if (_guidanceRunning) {
+        _map?.animateCamera(
+            gmaps.CameraUpdate.newLatLng(_currentLatLng!));
+      }
+      final dist = Geolocator.distanceBetween(pos.latitude, pos.longitude,
+          widget.placeLatLng.latitude, widget.placeLatLng.longitude);
+      setState(() {
+        _remainingMeters = dist;
+        if (dist <= widget.arrivalRadiusMeters) {
+          _status = 'Chegou ao destino. Corrida concluída.';
+          _guidanceRunning = false;
+        } else {
+          _status = 'Navegando...';
+        }
+      });
+    });
+  }
+
+  Future<void> _showRouteOverview() async {
+    if (_routeBounds != null) {
+      await _map?.animateCamera(
+          gmaps.CameraUpdate.newLatLngBounds(_routeBounds!, 50));
+    }
+  }
+
+  Future<void> _followMyLocation() async {
+    if (_currentLatLng != null) {
+      await _map?.animateCamera(
+          gmaps.CameraUpdate.newLatLng(_currentLatLng!));
+    }
   }
 
   String _fmtKm(double meters) {
@@ -210,16 +220,18 @@ class _TurnByTurnNavState extends State<TurnByTurnNav> {
           ? _WebNotSupported(status: _status)
           : Stack(
               children: [
-                gnav.GoogleMapsNavigationView(
-                  onViewCreated:
-                      (gnav.GoogleNavigationViewController controller) async {
-                    _view = controller;
-                    // Ajustes visuais do widget (tilt/bearing são geridos pelo SDK)
-                    await _view?.setNavigationUIEnabled(true);
-                    await _startNav();
+                gmaps.GoogleMap(
+                  initialCameraPosition: gmaps.CameraPosition(
+                      target: _toG(widget.userLatLng), zoom: 14),
+                  onMapCreated: (controller) {
+                    _map = controller;
+                    _loadRoute();
                   },
+                  myLocationEnabled: true,
+                  markers: _markers,
+                  polylines: _polylines,
+                  compassEnabled: widget.useDeviceCompass,
                 ),
-                // Overlay leve de status/ETA (o SDK já mostra instruções e UI nativa)
                 Positioned(
                   top: 12,
                   left: 12,
@@ -254,13 +266,13 @@ class _TurnByTurnNavState extends State<TurnByTurnNav> {
                           tooltip: 'Overview',
                           icon: const Icon(Icons.map_outlined,
                               color: Colors.white),
-                          onPressed: () => _view?.showRouteOverview(),
+                          onPressed: _showRouteOverview,
                         ),
                         IconButton(
                           tooltip: 'Seguir meu local',
                           icon: const Icon(Icons.center_focus_strong,
                               color: Colors.white),
-                          onPressed: () => _view?.followMyLocation(),
+                          onPressed: _followMyLocation,
                         ),
                       ],
                     ),
@@ -281,10 +293,11 @@ class _WebNotSupported extends StatelessWidget {
       color: Colors.black,
       alignment: Alignment.center,
       child: Text(
-        status.isEmpty ? 'Google Navigation não suporta Web.' : status,
+        status.isEmpty ? 'Google Maps não suporta Web.' : status,
         style: const TextStyle(color: Colors.white70),
         textAlign: TextAlign.center,
       ),
     );
   }
 }
+
