@@ -22,6 +22,8 @@ import 'package:google_maps_flutter/google_maps_flutter.dart' as gmaps;
 import 'package:geolocator/geolocator.dart';
 import 'package:flutter_polyline_points/flutter_polyline_points.dart';
 import 'package:http/http.dart' as http;
+import 'package:flutter_tts/flutter_tts.dart';
+import 'package:flutter_compass/flutter_compass.dart';
 import '/flutter_flow/lat_lng.dart' as ff;
 
 class TurnByTurnNav extends StatefulWidget {
@@ -54,6 +56,14 @@ class TurnByTurnNav extends StatefulWidget {
   State<TurnByTurnNav> createState() => _TurnByTurnNavState();
 }
 
+class _NavStep {
+  _NavStep(
+      {required this.start, required this.instruction, required this.distance});
+  final gmaps.LatLng start;
+  final String instruction;
+  final double distance;
+}
+
 class _TurnByTurnNavState extends State<TurnByTurnNav> {
   gmaps.GoogleMapController? _map;
   StreamSubscription<Position>? _posSub;
@@ -69,6 +79,23 @@ class _TurnByTurnNavState extends State<TurnByTurnNav> {
   gmaps.LatLng? _currentLatLng;
   gmaps.LatLngBounds? _routeBounds;
 
+  final FlutterTts _tts = FlutterTts();
+  StreamSubscription<CompassEvent>? _compassSub;
+  double _heading = 0;
+  List<_NavStep> _steps = [];
+  int _nextStep = 0;
+  bool _is3D = true;
+  static const String _darkMapStyle = '''[
+  {"elementType": "geometry", "stylers": [{"color": "#242f3e"}]},
+  {"elementType": "labels.text.fill", "stylers": [{"color": "#746855"}]},
+  {"elementType": "labels.text.stroke", "stylers": [{"color": "#242f3e"}]},
+  {"featureType": "road", "elementType": "geometry", "stylers": [{"color": "#38414e"}]},
+  {"featureType": "road", "elementType": "geometry.stroke", "stylers": [{"color": "#212a37"}]},
+  {"featureType": "road", "elementType": "labels.text.fill", "stylers": [{"color": "#9ca5b3"}]},
+  {"featureType": "water", "elementType": "geometry", "stylers": [{"color": "#17263c"}]},
+  {"featureType": "water", "elementType": "labels.text.fill", "stylers": [{"color": "#515c6d"}]}
+]''';
+
   gmaps.LatLng _toG(ff.LatLng v) =>
       gmaps.LatLng(v.latitude, v.longitude);
 
@@ -78,11 +105,28 @@ class _TurnByTurnNavState extends State<TurnByTurnNav> {
     if (kIsWeb) {
       _status = 'Navegação não suportada no Web.';
     }
+    if (widget.useDeviceCompass) {
+      _compassSub = FlutterCompass.events?.listen((event) {
+        if (event.heading != null) {
+          _heading = event.heading!;
+          if (_guidanceRunning && _is3D && _currentLatLng != null) {
+            _map?.animateCamera(gmaps.CameraUpdate.newCameraPosition(
+                gmaps.CameraPosition(
+                    target: _currentLatLng!,
+                    zoom: 17,
+                    tilt: 60,
+                    bearing: _heading)));
+          }
+        }
+      });
+    }
   }
 
   @override
   void dispose() {
     _posSub?.cancel();
+    _compassSub?.cancel();
+    _tts.stop();
     super.dispose();
   }
 
@@ -114,6 +158,14 @@ class _TurnByTurnNavState extends State<TurnByTurnNav> {
     final route = routes[0];
     final leg = (route['legs'] as List).first;
     final poly = route['overview_polyline']['points'] as String;
+    _steps = (leg['steps'] as List)
+        .map((s) => _NavStep(
+            start: gmaps.LatLng(
+                (s['start_location']['lat'] as num).toDouble(),
+                (s['start_location']['lng'] as num).toDouble()),
+            instruction: _stripHtml(s['html_instructions'] as String),
+            distance: (s['distance']['value'] as num).toDouble()))
+        .toList();
 
     final points = PolylinePoints().decodePolyline(poly);
     final polyCoords = points
@@ -122,7 +174,7 @@ class _TurnByTurnNavState extends State<TurnByTurnNav> {
 
     final polyline = gmaps.Polyline(
       polylineId: const gmaps.PolylineId('route'),
-      color: Colors.blue,
+      color: Colors.amber,
       width: 6,
       points: polyCoords,
     );
@@ -151,6 +203,7 @@ class _TurnByTurnNavState extends State<TurnByTurnNav> {
         gmaps.CameraUpdate.newLatLngBounds(_routeBounds!, 50));
 
     _startLocationUpdates();
+    _announceNextStep();
   }
 
   gmaps.LatLngBounds _boundsFrom(List<gmaps.LatLng> list) {
@@ -175,11 +228,24 @@ class _TurnByTurnNavState extends State<TurnByTurnNav> {
     _posSub = Geolocator.getPositionStream().listen((pos) {
       _currentLatLng = gmaps.LatLng(pos.latitude, pos.longitude);
       if (_guidanceRunning) {
-        _map?.animateCamera(
-            gmaps.CameraUpdate.newLatLng(_currentLatLng!));
+        final cam = gmaps.CameraPosition(
+            target: _currentLatLng!,
+            zoom: 17,
+            tilt: _is3D ? 60 : 0,
+            bearing: widget.useDeviceCompass ? _heading : 0);
+        _map?.animateCamera(gmaps.CameraUpdate.newCameraPosition(cam));
       }
       final dist = Geolocator.distanceBetween(pos.latitude, pos.longitude,
           widget.placeLatLng.latitude, widget.placeLatLng.longitude);
+      if (_nextStep < _steps.length) {
+        final step = _steps[_nextStep];
+        final sDist = Geolocator.distanceBetween(pos.latitude, pos.longitude,
+            step.start.latitude, step.start.longitude);
+        if (sDist < 30) {
+          _nextStep++;
+          _announceNextStep();
+        }
+      }
       setState(() {
         _remainingMeters = dist;
         if (dist <= widget.arrivalRadiusMeters) {
@@ -201,14 +267,41 @@ class _TurnByTurnNavState extends State<TurnByTurnNav> {
 
   Future<void> _followMyLocation() async {
     if (_currentLatLng != null) {
-      await _map?.animateCamera(
-          gmaps.CameraUpdate.newLatLng(_currentLatLng!));
+      await _map?.animateCamera(gmaps.CameraUpdate.newCameraPosition(
+          gmaps.CameraPosition(
+              target: _currentLatLng!,
+              zoom: 17,
+              tilt: _is3D ? 60 : 0,
+              bearing: widget.useDeviceCompass ? _heading : 0)));
     }
   }
 
   String _fmtKm(double meters) {
     if (meters < 1000) return '${meters.round()} m';
     return '${(meters / 1000).toStringAsFixed(1)} km';
+  }
+
+  String _stripHtml(String html) => html.replaceAll(RegExp(r'<[^>]*>'), '');
+
+  void _announceNextStep() {
+    if (_nextStep >= _steps.length) return;
+    final step = _steps[_nextStep];
+    final dist = step.distance.round();
+    _tts.setLanguage('pt-BR');
+    _tts.speak('Em $dist metros, ${step.instruction}');
+  }
+
+  Future<void> _toggleView() async {
+    _is3D = !_is3D;
+    if (_currentLatLng != null) {
+      final cam = gmaps.CameraPosition(
+          target: _currentLatLng!,
+          zoom: 17,
+          tilt: _is3D ? 60 : 0,
+          bearing: widget.useDeviceCompass ? _heading : 0);
+      await _map?.animateCamera(gmaps.CameraUpdate.newCameraPosition(cam));
+    }
+    setState(() {});
   }
 
   @override
@@ -225,6 +318,7 @@ class _TurnByTurnNavState extends State<TurnByTurnNav> {
                       target: _toG(widget.userLatLng), zoom: 14),
                   onMapCreated: (controller) {
                     _map = controller;
+                    controller.setMapStyle(_darkMapStyle);
                     _loadRoute();
                   },
                   myLocationEnabled: true,
@@ -273,6 +367,16 @@ class _TurnByTurnNavState extends State<TurnByTurnNav> {
                           icon: const Icon(Icons.center_focus_strong,
                               color: Colors.white),
                           onPressed: _followMyLocation,
+                        ),
+                        IconButton(
+                          tooltip:
+                              _is3D ? 'Vista de cima' : 'Vista 3D',
+                          icon: Icon(
+                              _is3D
+                                  ? Icons.videogame_asset_off
+                                  : Icons.threed_rotation,
+                              color: Colors.white),
+                          onPressed: _toggleView,
                         ),
                       ],
                     ),
