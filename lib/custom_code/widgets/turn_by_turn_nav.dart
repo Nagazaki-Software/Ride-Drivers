@@ -11,9 +11,9 @@ import 'package:flutter/material.dart';
 // DO NOT REMOVE OR MODIFY THE CODE ABOVE!
 
 // Turn-by-turn in-app map using native Google Maps SDK via google_maps_flutter.
-// Maintains the same public API:
+// Mantém a mesma API pública:
 //   TurnByTurnNav(apiKey, userLatLng, placeLatLng, ... width, height, useDeviceCompass)
-// Supports Android/iOS (Web shows message as plugin does not support full navigation).
+// Suporta Android/iOS (Web mostra mensagem pois o plugin não dá navegação completa).
 
 import 'dart:async';
 import 'dart:convert';
@@ -27,6 +27,7 @@ import 'package:flutter_tts/flutter_tts.dart';
 import 'package:flutter_compass/flutter_compass.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:url_launcher/url_launcher.dart';
+import 'package:firebase_auth/firebase_auth.dart'; // <-- NOVO
 import '/flutter_flow/lat_lng.dart' as ff;
 
 class TurnByTurnNav extends StatefulWidget {
@@ -99,14 +100,11 @@ class _TurnByTurnNavState extends State<TurnByTurnNav> {
   {"featureType": "water", "elementType": "labels.text.fill", "stylers": [{"color": "#515c6d"}]}
 ]''';
 
-  gmaps.BitmapDescriptor? _pickupIcon,
-      _destIcon,
-      _driverIcon; // Custom marker images
+  gmaps.BitmapDescriptor? _pickupIcon, _destIcon, _driverIcon;
   gmaps.LatLng? _prevLatLng;
   DateTime _lastFsWrite = DateTime.fromMillisecondsSinceEpoch(0);
 
-  gmaps.LatLng _toG(ff.LatLng v) =>
-      gmaps.LatLng(v.latitude, v.longitude);
+  gmaps.LatLng _toG(ff.LatLng v) => gmaps.LatLng(v.latitude, v.longitude);
 
   Future<void> _loadIcons() async {
     try {
@@ -137,11 +135,13 @@ class _TurnByTurnNavState extends State<TurnByTurnNav> {
           _heading = event.heading!;
           if (_guidanceRunning && _is3D && _currentLatLng != null) {
             _map?.animateCamera(gmaps.CameraUpdate.newCameraPosition(
-                gmaps.CameraPosition(
-                    target: _currentLatLng!,
-                    zoom: 17,
-                    tilt: 60,
-                    bearing: _heading)));
+              gmaps.CameraPosition(
+                target: _currentLatLng!,
+                zoom: 17,
+                tilt: 60,
+                bearing: _heading,
+              ),
+            ));
           }
         }
       });
@@ -164,76 +164,82 @@ class _TurnByTurnNavState extends State<TurnByTurnNav> {
     var url =
         'https://maps.googleapis.com/maps/api/directions/json?origin=$originStr&destination=$destStr&key=${widget.apiKey}';
     if (widget.initialDriverLatLng != null) {
-      final wp =
-          '${widget.userLatLng.latitude},${widget.userLatLng.longitude}';
+      final wp = '${widget.userLatLng.latitude},${widget.userLatLng.longitude}';
       url += '&waypoints=$wp';
     }
 
-    final res = await http.get(Uri.parse(url));
-    if (res.statusCode != 200) {
-      setState(() => _status = 'Erro ao obter rota');
-      return;
+    try {
+      final res = await http.get(Uri.parse(url));
+      if (res.statusCode != 200) {
+        setState(() => _status = 'Erro ao obter rota (${res.statusCode})');
+        return;
+      }
+      final data = json.decode(res.body);
+      final routes = data['routes'] as List?;
+      if (routes == null || routes.isEmpty) {
+        setState(() => _status = 'Rota não encontrada');
+        return;
+      }
+
+      final route = routes[0];
+      final leg = (route['legs'] as List).first;
+      final poly = route['overview_polyline']['points'] as String;
+      _steps = (leg['steps'] as List)
+          .map((s) => _NavStep(
+                start: gmaps.LatLng(
+                  (s['start_location']['lat'] as num).toDouble(),
+                  (s['start_location']['lng'] as num).toDouble(),
+                ),
+                instruction: _stripHtml(s['html_instructions'] as String),
+                distance: (s['distance']['value'] as num).toDouble(),
+              ))
+          .toList();
+
+      final points = PolylinePoints().decodePolyline(poly);
+      final polyCoords =
+          points.map((e) => gmaps.LatLng(e.latitude, e.longitude)).toList();
+
+      final polyline = gmaps.Polyline(
+        polylineId: const gmaps.PolylineId('route'),
+        color: const Color(0xFFFFC107),
+        width: 6,
+        points: polyCoords,
+      );
+
+      final pickupMarker = gmaps.Marker(
+        markerId: const gmaps.MarkerId('pickup'),
+        position: _toG(widget.userLatLng),
+        icon: _pickupIcon ??
+            gmaps.BitmapDescriptor.defaultMarkerWithHue(
+                gmaps.BitmapDescriptor.hueGreen),
+      );
+      final destMarker = gmaps.Marker(
+        markerId: const gmaps.MarkerId('dest'),
+        position: _toG(widget.placeLatLng),
+        icon: _destIcon ?? gmaps.BitmapDescriptor.defaultMarker,
+      );
+
+      _routeBounds = _boundsFrom(polyCoords);
+
+      setState(() {
+        _polylines = {polyline};
+        _markers = {pickupMarker, destMarker};
+        _etaText = leg['duration']['text'];
+        _remainingMeters = (leg['distance']['value'] as num).toDouble();
+        _status = 'Navegando...';
+        _guidanceRunning = true;
+      });
+
+      await _map?.animateCamera(
+        gmaps.CameraUpdate.newLatLngBounds(_routeBounds!, 50),
+      );
+
+      _startLocationUpdates();
+      _announceNextStep();
+    } catch (e) {
+      setState(() => _status = 'Falha ao carregar rota');
+      debugPrint('Erro ao carregar rota: $e');
     }
-    final data = json.decode(res.body);
-    final routes = data['routes'] as List?;
-    if (routes == null || routes.isEmpty) {
-      setState(() => _status = 'Rota não encontrada');
-      return;
-    }
-
-    final route = routes[0];
-    final leg = (route['legs'] as List).first;
-    final poly = route['overview_polyline']['points'] as String;
-    _steps = (leg['steps'] as List)
-        .map((s) => _NavStep(
-            start: gmaps.LatLng(
-                (s['start_location']['lat'] as num).toDouble(),
-                (s['start_location']['lng'] as num).toDouble()),
-            instruction: _stripHtml(s['html_instructions'] as String),
-            distance: (s['distance']['value'] as num).toDouble()))
-        .toList();
-
-    final points = PolylinePoints().decodePolyline(poly);
-    final polyCoords = points
-        .map((e) => gmaps.LatLng(e.latitude, e.longitude))
-        .toList();
-
-    final polyline = gmaps.Polyline(
-      polylineId: const gmaps.PolylineId('route'),
-      color: const Color(0xFFFFC107),
-      width: 6,
-      points: polyCoords,
-    );
-
-    final pickupMarker = gmaps.Marker(
-      markerId: const gmaps.MarkerId('pickup'),
-      position: _toG(widget.userLatLng),
-      icon: _pickupIcon ??
-          gmaps.BitmapDescriptor.defaultMarkerWithHue(
-              gmaps.BitmapDescriptor.hueGreen),
-    );
-    final destMarker = gmaps.Marker(
-      markerId: const gmaps.MarkerId('dest'),
-      position: _toG(widget.placeLatLng),
-      icon: _destIcon ?? gmaps.BitmapDescriptor.defaultMarker,
-    );
-
-    _routeBounds = _boundsFrom(polyCoords);
-
-    setState(() {
-      _polylines = {polyline};
-      _markers = {pickupMarker, destMarker};
-      _etaText = leg['duration']['text'];
-      _remainingMeters = (leg['distance']['value'] as num).toDouble();
-      _status = 'Navegando...';
-      _guidanceRunning = true;
-    });
-
-    await _map?.animateCamera(
-        gmaps.CameraUpdate.newLatLngBounds(_routeBounds!, 50));
-
-    _startLocationUpdates();
-    _announceNextStep();
   }
 
   gmaps.LatLngBounds _boundsFrom(List<gmaps.LatLng> list) {
@@ -250,7 +256,9 @@ class _TurnByTurnNavState extends State<TurnByTurnNav> {
       }
     }
     return gmaps.LatLngBounds(
-        southwest: gmaps.LatLng(x0!, y0!), northeast: gmaps.LatLng(x1!, y1!));
+      southwest: gmaps.LatLng(x0!, y0!),
+      northeast: gmaps.LatLng(x1!, y1!),
+    );
   }
 
   void _startLocationUpdates() {
@@ -259,10 +267,11 @@ class _TurnByTurnNavState extends State<TurnByTurnNav> {
       final newLatLng = gmaps.LatLng(pos.latitude, pos.longitude);
       if (!widget.useDeviceCompass && _prevLatLng != null) {
         _heading = Geolocator.bearingBetween(
-            _prevLatLng!.latitude,
-            _prevLatLng!.longitude,
-            pos.latitude,
-            pos.longitude);
+          _prevLatLng!.latitude,
+          _prevLatLng!.longitude,
+          pos.latitude,
+          pos.longitude,
+        );
       }
       _prevLatLng = newLatLng;
       _currentLatLng = newLatLng;
@@ -279,26 +288,38 @@ class _TurnByTurnNavState extends State<TurnByTurnNav> {
 
       if (_guidanceRunning) {
         final cam = gmaps.CameraPosition(
-            target: newLatLng,
-            zoom: 17,
-            tilt: _is3D ? 60 : 0,
-            bearing: widget.useDeviceCompass ? _heading : _heading);
+          target: newLatLng,
+          zoom: 17,
+          tilt: _is3D ? 60 : 0,
+          bearing: widget.useDeviceCompass ? _heading : _heading,
+        );
         _map?.animateCamera(gmaps.CameraUpdate.newCameraPosition(cam));
       }
-      final dist = Geolocator.distanceBetween(pos.latitude, pos.longitude,
-          widget.placeLatLng.latitude, widget.placeLatLng.longitude);
+
+      final dist = Geolocator.distanceBetween(
+        pos.latitude,
+        pos.longitude,
+        widget.placeLatLng.latitude,
+        widget.placeLatLng.longitude,
+      );
+
       if (_nextStep < _steps.length) {
         final step = _steps[_nextStep];
-        final sDist = Geolocator.distanceBetween(pos.latitude, pos.longitude,
-            step.start.latitude, step.start.longitude);
+        final sDist = Geolocator.distanceBetween(
+          pos.latitude,
+          pos.longitude,
+          step.start.latitude,
+          step.start.longitude,
+        );
         if (sDist < 30) {
           _nextStep++;
           _announceNextStep();
         }
       }
 
-      final updatedMarkers =
-          _markers.where((m) => m.markerId != const gmaps.MarkerId('driver')).toSet();
+      final updatedMarkers = _markers
+          .where((m) => m.markerId != const gmaps.MarkerId('driver'))
+          .toSet();
       updatedMarkers.add(userMarker);
 
       final now = DateTime.now();
@@ -321,10 +342,15 @@ class _TurnByTurnNavState extends State<TurnByTurnNav> {
   }
 
   Future<void> _sendLocationToFirestore(Position pos) async {
-    final uid = currentUserUid;
-    // TODO: caso currentUserUid não esteja disponível, injete o uid via outra fonte.
-    if (uid == null) return;
     try {
+      final user = FirebaseAuth.instance.currentUser; // <-- auth user
+      if (user == null) {
+        // Sem usuário logado, não grava nada.
+        debugPrint('Usuário não autenticado: pulando atualização no Firestore.');
+        return;
+      }
+      final uid = user.uid;
+
       await FirebaseFirestore.instance.collection('users').doc(uid).set({
         'location': GeoPoint(pos.latitude, pos.longitude),
         'heading': _heading,
@@ -344,10 +370,9 @@ class _TurnByTurnNavState extends State<TurnByTurnNav> {
     final wp = '${widget.userLatLng.latitude},${widget.userLatLng.longitude}';
 
     if (Platform.isIOS) {
-      // Attempt scheme if Google Maps app exists
-      final scheme = Uri.parse('comgooglemaps://?saddr=$o&daddr=$d&directionsmode=driving');
+      final scheme =
+          Uri.parse('comgooglemaps://?saddr=$o&daddr=$d&directionsmode=driving');
       if (await canLaunchUrl(scheme)) {
-        // comgooglemaps:// não aceita múltiplos waypoints oficialmente
         await launchUrl(scheme);
         return;
       }
@@ -369,18 +394,23 @@ class _TurnByTurnNavState extends State<TurnByTurnNav> {
   Future<void> _showRouteOverview() async {
     if (_routeBounds != null) {
       await _map?.animateCamera(
-          gmaps.CameraUpdate.newLatLngBounds(_routeBounds!, 50));
+        gmaps.CameraUpdate.newLatLngBounds(_routeBounds!, 50),
+      );
     }
   }
 
   Future<void> _followMyLocation() async {
     if (_currentLatLng != null) {
-      await _map?.animateCamera(gmaps.CameraUpdate.newCameraPosition(
+      await _map?.animateCamera(
+        gmaps.CameraUpdate.newCameraPosition(
           gmaps.CameraPosition(
-              target: _currentLatLng!,
-              zoom: 17,
-              tilt: _is3D ? 60 : 0,
-              bearing: widget.useDeviceCompass ? _heading : 0)));
+            target: _currentLatLng!,
+            zoom: 17,
+            tilt: _is3D ? 60 : 0,
+            bearing: widget.useDeviceCompass ? _heading : 0,
+          ),
+        ),
+      );
     }
   }
 
@@ -403,10 +433,11 @@ class _TurnByTurnNavState extends State<TurnByTurnNav> {
     _is3D = !_is3D;
     if (_currentLatLng != null) {
       final cam = gmaps.CameraPosition(
-          target: _currentLatLng!,
-          zoom: 17,
-          tilt: _is3D ? 60 : 0,
-          bearing: widget.useDeviceCompass ? _heading : 0);
+        target: _currentLatLng!,
+        zoom: 17,
+        tilt: _is3D ? 60 : 0,
+        bearing: widget.useDeviceCompass ? _heading : 0,
+      );
       await _map?.animateCamera(gmaps.CameraUpdate.newCameraPosition(cam));
     }
     setState(() {});
@@ -439,8 +470,8 @@ class _TurnByTurnNavState extends State<TurnByTurnNav> {
                   left: 12,
                   right: 12,
                   child: Container(
-                    padding: const EdgeInsets.symmetric(
-                        horizontal: 14, vertical: 10),
+                    padding:
+                        const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
                     decoration: BoxDecoration(
                       color: Colors.black.withOpacity(0.70),
                       borderRadius: BorderRadius.circular(14),
@@ -466,8 +497,7 @@ class _TurnByTurnNavState extends State<TurnByTurnNav> {
                         const SizedBox(width: 6),
                         IconButton(
                           tooltip: 'Overview',
-                          icon: const Icon(Icons.map_outlined,
-                              color: Colors.white),
+                          icon: const Icon(Icons.map_outlined, color: Colors.white),
                           onPressed: _showRouteOverview,
                         ),
                         IconButton(
@@ -477,13 +507,13 @@ class _TurnByTurnNavState extends State<TurnByTurnNav> {
                           onPressed: _followMyLocation,
                         ),
                         IconButton(
-                          tooltip:
-                              _is3D ? 'Vista de cima' : 'Vista 3D',
+                          tooltip: _is3D ? 'Vista de cima' : 'Vista 3D',
                           icon: Icon(
-                              _is3D
-                                  ? Icons.videogame_asset_off
-                                  : Icons.threed_rotation,
-                              color: Colors.white),
+                            _is3D
+                                ? Icons.videogame_asset_off
+                                : Icons.threed_rotation,
+                            color: Colors.white,
+                          ),
                           onPressed: _toggleView,
                         ),
                       ],
@@ -495,8 +525,9 @@ class _TurnByTurnNavState extends State<TurnByTurnNav> {
                   right: 16,
                   child: ElevatedButton.icon(
                     style: ElevatedButton.styleFrom(
-                        backgroundColor: Colors.black87,
-                        foregroundColor: Colors.white),
+                      backgroundColor: Colors.black87,
+                      foregroundColor: Colors.white,
+                    ),
                     onPressed: _openGoogleNavigation,
                     icon: const Icon(Icons.navigation),
                     label: const Text('Navegar no Google'),
@@ -524,4 +555,3 @@ class _WebNotSupported extends StatelessWidget {
     );
   }
 }
-
