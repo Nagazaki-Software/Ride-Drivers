@@ -17,6 +17,7 @@ import 'package:flutter/material.dart';
 
 import 'dart:async';
 import 'dart:convert';
+import 'dart:io' show Platform;
 import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:google_maps_flutter/google_maps_flutter.dart' as gmaps;
 import 'package:geolocator/geolocator.dart';
@@ -24,6 +25,8 @@ import 'package:flutter_polyline_points/flutter_polyline_points.dart';
 import 'package:http/http.dart' as http;
 import 'package:flutter_tts/flutter_tts.dart';
 import 'package:flutter_compass/flutter_compass.dart';
+import 'package:cloud_firestore/cloud_firestore.dart';
+import 'package:url_launcher/url_launcher.dart';
 import '/flutter_flow/lat_lng.dart' as ff;
 
 class TurnByTurnNav extends StatefulWidget {
@@ -96,12 +99,35 @@ class _TurnByTurnNavState extends State<TurnByTurnNav> {
   {"featureType": "water", "elementType": "labels.text.fill", "stylers": [{"color": "#515c6d"}]}
 ]''';
 
+  gmaps.BitmapDescriptor? _pickupIcon,
+      _destIcon,
+      _driverIcon; // Custom marker images
+  gmaps.LatLng? _prevLatLng;
+  DateTime _lastFsWrite = DateTime.fromMillisecondsSinceEpoch(0);
+
   gmaps.LatLng _toG(ff.LatLng v) =>
       gmaps.LatLng(v.latitude, v.longitude);
+
+  Future<void> _loadIcons() async {
+    try {
+      _pickupIcon = await gmaps.BitmapDescriptor.fromAssetImage(
+          const ImageConfiguration(size: Size(64, 64)),
+          'assets/images/pickup_marker.png');
+      _destIcon = await gmaps.BitmapDescriptor.fromAssetImage(
+          const ImageConfiguration(size: Size(64, 64)),
+          'assets/images/destination_marker.png');
+      _driverIcon = await gmaps.BitmapDescriptor.fromAssetImage(
+          const ImageConfiguration(size: Size(64, 64)),
+          'assets/images/driver_marker.png');
+    } catch (e) {
+      debugPrint('Erro ao carregar ícones do mapa: $e');
+    }
+  }
 
   @override
   void initState() {
     super.initState();
+    _loadIcons();
     if (kIsWeb) {
       _status = 'Navegação não suportada no Web.';
     }
@@ -174,7 +200,7 @@ class _TurnByTurnNavState extends State<TurnByTurnNav> {
 
     final polyline = gmaps.Polyline(
       polylineId: const gmaps.PolylineId('route'),
-      color: Colors.amber,
+      color: const Color(0xFFFFC107),
       width: 6,
       points: polyCoords,
     );
@@ -182,10 +208,14 @@ class _TurnByTurnNavState extends State<TurnByTurnNav> {
     final pickupMarker = gmaps.Marker(
       markerId: const gmaps.MarkerId('pickup'),
       position: _toG(widget.userLatLng),
+      icon: _pickupIcon ??
+          gmaps.BitmapDescriptor.defaultMarkerWithHue(
+              gmaps.BitmapDescriptor.hueGreen),
     );
     final destMarker = gmaps.Marker(
       markerId: const gmaps.MarkerId('dest'),
       position: _toG(widget.placeLatLng),
+      icon: _destIcon ?? gmaps.BitmapDescriptor.defaultMarker,
     );
 
     _routeBounds = _boundsFrom(polyCoords);
@@ -226,13 +256,33 @@ class _TurnByTurnNavState extends State<TurnByTurnNav> {
   void _startLocationUpdates() {
     _posSub?.cancel();
     _posSub = Geolocator.getPositionStream().listen((pos) {
-      _currentLatLng = gmaps.LatLng(pos.latitude, pos.longitude);
+      final newLatLng = gmaps.LatLng(pos.latitude, pos.longitude);
+      if (!widget.useDeviceCompass && _prevLatLng != null) {
+        _heading = Geolocator.bearingBetween(
+            _prevLatLng!.latitude,
+            _prevLatLng!.longitude,
+            pos.latitude,
+            pos.longitude);
+      }
+      _prevLatLng = newLatLng;
+      _currentLatLng = newLatLng;
+
+      final userMarker = gmaps.Marker(
+        markerId: const gmaps.MarkerId('driver'),
+        position: newLatLng,
+        icon: _driverIcon ??
+            gmaps.BitmapDescriptor.defaultMarkerWithHue(
+                gmaps.BitmapDescriptor.hueAzure),
+        rotation: _heading,
+        anchor: const Offset(0.5, 0.5),
+      );
+
       if (_guidanceRunning) {
         final cam = gmaps.CameraPosition(
-            target: _currentLatLng!,
+            target: newLatLng,
             zoom: 17,
             tilt: _is3D ? 60 : 0,
-            bearing: widget.useDeviceCompass ? _heading : 0);
+            bearing: widget.useDeviceCompass ? _heading : _heading);
         _map?.animateCamera(gmaps.CameraUpdate.newCameraPosition(cam));
       }
       final dist = Geolocator.distanceBetween(pos.latitude, pos.longitude,
@@ -246,7 +296,19 @@ class _TurnByTurnNavState extends State<TurnByTurnNav> {
           _announceNextStep();
         }
       }
+
+      final updatedMarkers =
+          _markers.where((m) => m.markerId != const gmaps.MarkerId('driver')).toSet();
+      updatedMarkers.add(userMarker);
+
+      final now = DateTime.now();
+      if (now.difference(_lastFsWrite).inMilliseconds > 500) {
+        _lastFsWrite = now;
+        _sendLocationToFirestore(pos);
+      }
+
       setState(() {
+        _markers = updatedMarkers;
         _remainingMeters = dist;
         if (dist <= widget.arrivalRadiusMeters) {
           _status = 'Chegou ao destino. Corrida concluída.';
@@ -256,6 +318,52 @@ class _TurnByTurnNavState extends State<TurnByTurnNav> {
         }
       });
     });
+  }
+
+  Future<void> _sendLocationToFirestore(Position pos) async {
+    final uid = currentUserUid;
+    // TODO: caso currentUserUid não esteja disponível, injete o uid via outra fonte.
+    if (uid == null) return;
+    try {
+      await FirebaseFirestore.instance.collection('users').doc(uid).set({
+        'location': GeoPoint(pos.latitude, pos.longitude),
+        'heading': _heading,
+        'speed': pos.speed,
+        'updatedAt': FieldValue.serverTimestamp(),
+      }, SetOptions(merge: true));
+    } catch (e) {
+      debugPrint('Erro ao atualizar localização no Firestore: $e');
+    }
+  }
+
+  Future<void> _openGoogleNavigation() async {
+    final origin = _currentLatLng ?? _toG(widget.userLatLng);
+    final dest = _toG(widget.placeLatLng);
+    final o = '${origin.latitude},${origin.longitude}';
+    final d = '${dest.latitude},${dest.longitude}';
+    final wp = '${widget.userLatLng.latitude},${widget.userLatLng.longitude}';
+
+    if (Platform.isIOS) {
+      // Attempt scheme if Google Maps app exists
+      final scheme = Uri.parse('comgooglemaps://?saddr=$o&daddr=$d&directionsmode=driving');
+      if (await canLaunchUrl(scheme)) {
+        // comgooglemaps:// não aceita múltiplos waypoints oficialmente
+        await launchUrl(scheme);
+        return;
+      }
+      final gUrl = Uri.parse(
+          'https://www.google.com/maps/dir/?api=1&origin=$o&destination=$d&travelmode=driving&dir_action=navigate&waypoints=$wp');
+      if (await canLaunchUrl(gUrl)) {
+        await launchUrl(gUrl, mode: LaunchMode.externalApplication);
+        return;
+      }
+      final apple = Uri.parse('https://maps.apple.com/?saddr=$o&daddr=$d&dirflg=d');
+      await launchUrl(apple, mode: LaunchMode.externalApplication);
+    } else {
+      final url = Uri.parse(
+          'https://www.google.com/maps/dir/?api=1&origin=$o&destination=$d&travelmode=driving&dir_action=navigate&waypoints=$wp');
+      await launchUrl(url, mode: LaunchMode.externalApplication);
+    }
   }
 
   Future<void> _showRouteOverview() async {
@@ -380,6 +488,18 @@ class _TurnByTurnNavState extends State<TurnByTurnNav> {
                         ),
                       ],
                     ),
+                  ),
+                ),
+                Positioned(
+                  bottom: 16,
+                  right: 16,
+                  child: ElevatedButton.icon(
+                    style: ElevatedButton.styleFrom(
+                        backgroundColor: Colors.black87,
+                        foregroundColor: Colors.white),
+                    onPressed: _openGoogleNavigation,
+                    icon: const Icon(Icons.navigation),
+                    label: const Text('Navegar no Google'),
                   ),
                 ),
               ],
